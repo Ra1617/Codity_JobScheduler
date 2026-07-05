@@ -1,0 +1,1676 @@
+<USER_REQUEST>
+# Distributed Job Scheduler — Backend API Build Instructions
+
+> [!IMPORTANT]
+> These instructions are **sequential** — build in the exact order listed. Each section depends on the previous ones. Every file, function signature, and design decision is specified. Follow them exactly.
+
+---
+
+## Phase 0: Project Setup
+
+### 0.1 Initialize Project Directory
+
+```
+distributed-job-scheduler/
+├── backend/
+│   ├── app/
+│   │   ├── __init__.py
+│   │   ├── api/
+│   │   ├── core/
+│   │   ├── database/
+│   │   ├── models/
+│   │   ├── schemas/
+│   │   ├── services/
+│   │   ├── repositories/
+│   │   ├── workers/
+│   │   ├── scheduler/
+│   │   ├── middleware/
+│   │   ├── utils/
+│   │   └── tests/
+│   ├── main.py
+│   └── requirements.txt
+```
+
+Every subdirectory under `app/` must have an `__init__.py` file.
+
+### 0.2 `requirements.txt`
+
+```
+fastapi==0.115.0
+uvicorn[standard]==0.30.0
+sqlalchemy==2.0.35
+asyncpg==0.30.0
+alembic==1.13.0
+pydantic==2.9.0
+pydantic-settings==2.5.0
+python-jose[cryptography]==3.3.0
+passlib[bcrypt]==1.7.4
+python-multipart==0.0.12
+httpx==0.27.0
+apscheduler==3.10.4
+croniter==3.0.0
+structlog==24.4.0
+slowapi==0.1.9
+pytest==8.3.0
+pytest-asyncio==0.24.0
+pytest-httpx==0.32.0
+factory-boy==3.3.0
+```
+
+### 0.3 `.env` (root level)
+
+```env
+DATABASE_URL=postgresql+asyncpg://admin:admin@localhost:5432/jobscheduler
+SECRET_KEY=your-super-secret-key-change-in-production
+ALGORITHM=HS256
+ACCESS_TOKEN_EXPIRE_MINUTES=30
+ENVIRONMENT=development
+LOG_LEVEL=INFO
+WORKERS_POLL_INTERVAL=5
+WORKERS_HEARTBEAT_INTERVAL=30
+```
+
+---
+
+## Phase 1: Core Module (`app/core/`)
+
+Build these files first — everything else depends on them.
+
+---
+
+### 1.1 `app/core/config.py`
+
+**Purpose**: Centralized configuration loaded from environment variables.
+
+```python
+from pydantic_settings import BaseSettings
+
+class Settings(BaseSettings):
+    # Database
+    DATABASE_URL: str
+    
+    # Auth
+    SECRET_KEY: str
+    ALGORITHM: str = "HS256"
+    ACCESS_TOKEN_EXPIRE_MINUTES: int = 30
+    
+    # App
+    ENVIRONMENT: str = "development"
+    LOG_LEVEL: str = "INFO"
+    APP_NAME: str = "Distributed Job Scheduler"
+    API_V1_PREFIX: str = "/api/v1"
+    
+    # Workers
+    WORKERS_POLL_INTERVAL: int = 5
+    WORKERS_HEARTBEAT_INTERVAL: int = 30
+    
+    class Config:
+        env_file = ".env"
+        case_sensitive = True
+
+settings = Settings()
+```
+
+---
+
+### 1.2 `app/core/constants.py`
+
+**Purpose**: All enums and constant values used across the app. These MUST match the ER diagram exactly.
+
+```python
+import enum
+
+class UserRole(str, enum.Enum):
+    ADMIN = "admin"
+    MEMBER = "member"
+    VIEWER = "viewer"
+
+class JobStatus(str, enum.Enum):
+    QUEUED = "queued"
+    SCHEDULED = "scheduled"
+    CLAIMED = "claimed"
+    RUNNING = "running"
+    COMPLETED = "completed"
+    FAILED = "failed"
+    TIMED_OUT = "timed_out"
+    DEAD = "dead"
+
+class JobType(str, enum.Enum):
+    IMMEDIATE = "immediate"
+    DELAYED = "delayed"
+    SCHEDULED = "scheduled"
+    RECURRING = "recurring"
+    BATCH = "batch"
+
+class BackoffStrategy(str, enum.Enum):
+    FIXED = "fixed"
+    LINEAR = "linear"
+    EXPONENTIAL = "exponential"
+
+class WorkerStatus(str, enum.Enum):
+    ONLINE = "online"
+    BUSY = "busy"
+    DRAINING = "draining"
+    OFFLINE = "offline"
+
+class ExecutionStatus(str, enum.Enum):
+    RUNNING = "running"
+    COMPLETED = "completed"
+    FAILED = "failed"
+    TIMED_OUT = "timed_out"
+
+class BatchStatus(str, enum.Enum):
+    PENDING = "pending"
+    RUNNING = "running"
+    COMPLETED = "completed"
+    PARTIAL_FAILURE = "partial_failure"
+    FAILED = "failed"
+
+class LogLevel(str, enum.Enum):
+    DEBUG = "debug"
+    INFO = "info"
+    WARNING = "warning"
+    ERROR = "error"
+    CRITICAL = "critical"
+
+class HeartbeatStatus(str, enum.Enum):
+    HEALTHY = "healthy"
+    DEGRADED = "degraded"
+    UNHEALTHY = "unhealthy"
+```
+
+---
+
+### 1.3 `app/core/exceptions.py`
+
+**Purpose**: Custom exception classes for structured error handling.
+
+```python
+from fastapi import HTTPException, status
+
+class AppException(HTTPException):
+    def __init__(self, status_code: int, detail: str, error_code: str = None):
+        super().__init__(status_code=status_code, detail=detail)
+        self.error_code = error_code
+
+class NotFoundException(AppException):
+    def __init__(self, resource: str, resource_id: str):
+        super().__init__(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"{resource} with id '{resource_id}' not found",
+            error_code="RESOURCE_NOT_FOUND"
+        )
+
+class ConflictException(AppException):
+    def __init__(self, detail: str):
+        super().__init__(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=detail,
+            error_code="CONFLICT"
+        )
+
+class ForbiddenException(AppException):
+    def __init__(self, detail: str = "Insufficient permissions"):
+        super().__init__(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail=detail,
+            error_code="FORBIDDEN"
+        )
+
+class QueuePausedException(AppException):
+    def __init__(self, queue_id: str):
+        super().__init__(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=f"Queue '{queue_id}' is paused. Resume it before submitting jobs.",
+            error_code="QUEUE_PAUSED"
+        )
+
+class IdempotencyConflictException(AppException):
+    def __init__(self, idempotency_key: str):
+        super().__init__(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=f"Job with idempotency_key '{idempotency_key}' already exists",
+            error_code="IDEMPOTENCY_CONFLICT"
+        )
+```
+
+---
+
+### 1.4 `app/core/security.py`
+
+**Purpose**: JWT token creation/verification and password hashing.
+
+Implement:
+- `hash_password(password: str) -> str` — uses `passlib` bcrypt
+- `verify_password(plain: str, hashed: str) -> bool`
+- `create_access_token(data: dict, expires_delta: timedelta = None) -> str` — JWT with `python-jose`, embed `sub` (user_id), `org_id`, `role` in payload
+- `decode_access_token(token: str) -> dict` — raises `HTTPException(401)` on invalid/expired
+
+---
+
+### 1.5 `app/core/logger.py`
+
+**Purpose**: Structured JSON logging via `structlog`.
+
+Configure structlog with:
+- JSON output in production, pretty console in development
+- Bind `request_id`, `user_id`, `org_id` per-request
+- Log levels from `settings.LOG_LEVEL`
+
+Export a `get_logger()` function that returns a bound logger.
+
+---
+
+### 1.6 `app/core/dependencies.py`
+
+**Purpose**: FastAPI dependency injection functions.
+
+Implement:
+- `get_db() -> AsyncGenerator[AsyncSession]` — yields a database session
+- `get_current_user(token: str = Depends(oauth2_scheme), db: AsyncSession = Depends(get_db)) -> User` — extracts user from JWT, queries DB, raises 401 if invalid
+- `require_role(allowed_roles: list[UserRole])` — returns a dependency that raises 403 if user's role is not in `allowed_roles`
+- `PaginationParams` — a dataclass/model with `page: int = 1`, `page_size: int = 20` (max 100)
+
+---
+
+## Phase 2: Database Layer (`app/database/`)
+
+---
+
+### 2.1 `app/database/base.py`
+
+**Purpose**: SQLAlchemy declarative base and common mixins.
+
+```python
+from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
+from sqlalchemy import DateTime, func
+from datetime import datetime
+import uuid
+
+class Base(DeclarativeBase):
+    pass
+
+class TimestampMixin:
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False
+    )
+
+class UUIDPrimaryKeyMixin:
+    id: Mapped[uuid.UUID] = mapped_column(
+        primary_key=True, default=uuid.uuid4
+    )
+```
+
+---
+
+### 2.2 `app/database/database.py`
+
+**Purpose**: Async SQLAlchemy engine and session factory.
+
+```python
+from sqlalchemy.ext.asyncio import create_async_engine, async_sessionmaker, AsyncSession
+from app.core.config import settings
+
+engine = create_async_engine(
+    settings.DATABASE_URL,
+    echo=(settings.ENVIRONMENT == "development"),
+    pool_size=20,
+    max_overflow=10,
+    pool_pre_ping=True,
+)
+
+AsyncSessionLocal = async_sessionmaker(
+    engine, class_=AsyncSession, expire_on_commit=False
+)
+```
+
+---
+
+### 2.3 `app/database/session.py`
+
+**Purpose**: Session context manager and dependency.
+
+```python
+from contextlib import asynccontextmanager
+
+@asynccontextmanager
+async def get_session():
+    async with AsyncSessionLocal() as session:
+        try:
+            yield session
+            await session.commit()
+        except Exception:
+            await session.rollback()
+            raise
+        finally:
+            await session.close()
+```
+
+---
+
+### 2.4 `app/database/seed.py`
+
+**Purpose**: Seed script that creates:
+1. A default organization ("Default Org")
+2. An admin user (`admin@example.com` / `password123`)
+3. A sample project, queue, and retry policy
+
+This MUST be idempotent — check if records exist before inserting. This runs on `docker-compose up`.
+
+---
+
+### 2.5 Migrations (`app/database/migrations/`)
+
+Use **Alembic** with async support. Initialize with:
+```bash
+alembic init -t async app/database/migrations
+```
+
+Configure `alembic.ini` to read `DATABASE_URL` from env. Configure `env.py` to import `Base.metadata` from `app/database/base.py`.
+
+---
+
+## Phase 3: Models (`app/models/`)
+
+Every model must:
+- Inherit from `Base`, `UUIDPrimaryKeyMixin` (or use `bigint` for high-volume tables), and `TimestampMixin`
+- Define `__tablename__`
+- Define all columns matching the ER diagram exactly
+- Define SQLAlchemy `relationship()` for navigation
+- Define `__repr__` for debugging
+
+Build models in dependency order — parents before children.
+
+---
+
+### 3.1 `app/models/organization.py`
+
+| Column | Type | Constraints |
+|:---|:---|:---|
+| id | UUID | PK, default uuid4 |
+| name | VARCHAR(255) | NOT NULL |
+| slug | VARCHAR(255) | NOT NULL, UNIQUE |
+| created_at | TIMESTAMPTZ | server default now() |
+| updated_at | TIMESTAMPTZ | server default now(), onupdate |
+
+Relationships: `users`, `projects`, `retry_policies`, `workers` (all one-to-many)
+
+---
+
+### 3.2 `app/models/user.py`
+
+| Column | Type | Constraints |
+|:---|:---|:---|
+| id | UUID | PK |
+| organization_id | UUID | FK → organizations.id, NOT NULL |
+| email | VARCHAR(255) | NOT NULL, UNIQUE |
+| password_hash | VARCHAR(255) | NOT NULL |
+| full_name | VARCHAR(255) | NOT NULL |
+| role | ENUM(UserRole) | NOT NULL, default MEMBER |
+| is_active | BOOLEAN | NOT NULL, default True |
+| created_at | TIMESTAMPTZ | |
+| updated_at | TIMESTAMPTZ | |
+
+Index on `email` (unique), index on `organization_id`.
+
+---
+
+### 3.3 `app/models/project.py`
+
+| Column | Type | Constraints |
+|:---|:---|:---|
+| id | UUID | PK |
+| organization_id | UUID | FK → organizations.id, NOT NULL |
+| created_by | UUID | FK → users.id, NOT NULL |
+| name | VARCHAR(255) | NOT NULL |
+| description | TEXT | NULLABLE |
+| created_at | TIMESTAMPTZ | |
+| updated_at | TIMESTAMPTZ | |
+
+Relationships: `queues` (one-to-many), `organization`, `creator`
+
+---
+
+### 3.4 `app/models/retry_policy.py`
+
+| Column | Type | Constraints |
+|:---|:---|:---|
+| id | UUID | PK |
+| organization_id | UUID | FK → organizations.id, NOT NULL |
+| name | VARCHAR(255) | NOT NULL |
+| max_attempts | INT | NOT NULL, default 3 |
+| backoff_strategy | ENUM(BackoffStrategy) | NOT NULL, default EXPONENTIAL |
+| base_delay_seconds | INT | NOT NULL, default 60 |
+| max_delay_seconds | INT | NOT NULL, default 3600 |
+| created_at | TIMESTAMPTZ | |
+| updated_at | TIMESTAMPTZ | |
+
+---
+
+### 3.5 `app/models/queue.py`
+
+| Column | Type | Constraints |
+|:---|:---|:---|
+| id | UUID | PK |
+| project_id | UUID | FK → projects.id, NOT NULL |
+| default_retry_policy_id | UUID | FK → retry_policies.id, NULLABLE, ON DELETE SET NULL |
+| name | VARCHAR(255) | NOT NULL |
+| description | TEXT | NULLABLE |
+| priority | SMALLINT | NOT NULL, default 0 |
+| max_concurrency | INT | NOT NULL, default 10 |
+| timeout_seconds | INT | NOT NULL, default 3600 |
+| is_paused | BOOLEAN | NOT NULL, default False |
+| created_at | TIMESTAMPTZ | |
+| updated_at | TIMESTAMPTZ | |
+
+Unique constraint on `(project_id, name)`.
+Relationships: `project`, `default_retry_policy`, `jobs`, `scheduled_jobs`
+
+---
+
+### 3.6 `app/models/job.py`
+
+| Column | Type | Constraints |
+|:---|:---|:---|
+| id | UUID | PK |
+| queue_id | UUID | FK → queues.id, NOT NULL |
+| batch_id | UUID | FK → batches.id, NULLABLE, ON DELETE SET NULL |
+| scheduled_job_id | UUID | FK → scheduled_jobs.id, NULLABLE, ON DELETE SET NULL |
+| retry_policy_id | UUID | FK → retry_policies.id, NULLABLE, ON DELETE SET NULL |
+| created_by | UUID | FK → users.id, NOT NULL |
+| idempotency_key | VARCHAR(255) | NULLABLE, UNIQUE |
+| job_type | VARCHAR(50) | NOT NULL |
+| payload | JSONB | NOT NULL, default {} |
+| tags | JSONB | NULLABLE |
+| priority | SMALLINT | NOT NULL, default 0 |
+| status | ENUM(JobStatus) | NOT NULL, default QUEUED |
+| attempt_count | INT | NOT NULL, default 0 |
+| timeout_seconds | INT | NULLABLE |
+| available_at | TIMESTAMPTZ | NULLABLE |
+| started_at | TIMESTAMPTZ | NULLABLE |
+| completed_at | TIMESTAMPTZ | NULLABLE |
+| created_at | TIMESTAMPTZ | |
+| updated_at | TIMESTAMPTZ | |
+
+**Critical index** (the hot-path for worker claiming):
+```python
+Index(
+    "idx_jobs_claimable",
+    "queue_id", "status", "priority", "available_at",
+    postgresql_where=text("status = 'queued'")
+)
+```
+
+Also index on `idempotency_key` (unique), `batch_id`, `scheduled_job_id`, `created_by`.
+
+---
+
+### 3.7 `app/models/batch.py`
+
+| Column | Type | Constraints |
+|:---|:---|:---|
+| id | UUID | PK |
+| queue_id | UUID | FK → queues.id, NOT NULL |
+| created_by | UUID | FK → users.id, NOT NULL |
+| name | VARCHAR(255) | NULLABLE |
+| total_jobs | INT | NOT NULL, default 0 |
+| completed_jobs | INT | NOT NULL, default 0 |
+| failed_jobs | INT | NOT NULL, default 0 |
+| status | ENUM(BatchStatus) | NOT NULL, default PENDING |
+| created_at | TIMESTAMPTZ | |
+| completed_at | TIMESTAMPTZ | NULLABLE |
+
+---
+
+### 3.8 `app/models/scheduled_job.py`
+
+| Column | Type | Constraints |
+|:---|:---|:---|
+| id | UUID | PK |
+| queue_id | UUID | FK → queues.id, NOT NULL |
+| retry_policy_id | UUID | FK → retry_policies.id, NULLABLE |
+| created_by | UUID | FK → users.id, NOT NULL |
+| name | VARCHAR(255) | NOT NULL |
+| cron_expression | VARCHAR(100) | NOT NULL |
+| payload_template | JSONB | NOT NULL, default {} |
+| is_active | BOOLEAN | NOT NULL, default True |
+| next_run_at | TIMESTAMPTZ | NULLABLE |
+| last_run_at | TIMESTAMPTZ | NULLABLE |
+| created_at | TIMESTAMPTZ | |
+| updated_at | TIMESTAMPTZ | |
+
+Index on `(is_active, next_run_at)` for scheduler polling.
+
+---
+
+### 3.9 `app/models/worker.py`
+
+| Column | Type | Constraints |
+|:---|:---|:---|
+| id | UUID | PK |
+| organization_id | UUID | FK → organizations.id, NOT NULL |
+| hostname | VARCHAR(255) | NOT NULL |
+| version | VARCHAR(50) | NULLABLE |
+| status | ENUM(WorkerStatus) | NOT NULL, default ONLINE |
+| last_heartbeat_at | TIMESTAMPTZ | NULLABLE |
+| created_at | TIMESTAMPTZ | |
+| updated_at | TIMESTAMPTZ | |
+
+---
+
+### 3.10 `app/models/heartbeat.py`
+
+| Column | Type | Constraints |
+|:---|:---|:---|
+| id | BIGINT | PK, autoincrement |
+| worker_id | UUID | FK → workers.id, NOT NULL |
+| reported_at | TIMESTAMPTZ | NOT NULL, server default now() |
+| cpu_usage | NUMERIC(5,2) | NULLABLE |
+| memory_usage | NUMERIC(5,2) | NULLABLE |
+| active_jobs | INT | NOT NULL, default 0 |
+| status | ENUM(HeartbeatStatus) | NOT NULL, default HEALTHY |
+
+Index on `(worker_id, reported_at DESC)`.
+**No `created_at`/`updated_at`** — `reported_at` serves as the timestamp. This is append-only.
+
+---
+
+### 3.11 `app/models/job_execution.py`
+
+| Column | Type | Constraints |
+|:---|:---|:---|
+| id | UUID | PK |
+| job_id | UUID | FK → jobs.id, NOT NULL |
+| worker_id | UUID | FK → workers.id, NULLABLE, ON DELETE SET NULL |
+| attempt_number | INT | NOT NULL |
+| status | ENUM(ExecutionStatus) | NOT NULL, default RUNNING |
+| started_at | TIMESTAMPTZ | NOT NULL, server default now() |
+| completed_at | TIMESTAMPTZ | NULLABLE |
+| result | JSONB | NULLABLE |
+| error_message | TEXT | NULLABLE |
+| next_retry_at | TIMESTAMPTZ | NULLABLE |
+
+Unique constraint on `(job_id, attempt_number)`.
+Index on `worker_id`, `job_id`.
+
+---
+
+### 3.12 `app/models/job_log.py`
+
+| Column | Type | Constraints |
+|:---|:---|:---|
+| id | BIGINT | PK, autoincrement |
+| job_execution_id | UUID | FK → job_executions.id, NOT NULL |
+| log_level | ENUM(LogLevel) | NOT NULL, default INFO |
+| message | TEXT | NOT NULL |
+| logged_at | TIMESTAMPTZ | NOT NULL, server default now() |
+
+Index on `(job_execution_id, logged_at)`.
+**Append-only, high-volume** — use BIGINT PK.
+
+---
+
+### 3.13 `app/models/dead_letter_queue.py`
+
+| Column | Type | Constraints |
+|:---|:---|:---|
+| id | UUID | PK |
+| job_id | UUID | FK → jobs.id, NOT NULL, UNIQUE |
+| last_execution_id | UUID | FK → job_executions.id, NULLABLE |
+| failure_reason | TEXT | NOT NULL |
+| attempt_count | INT | NOT NULL |
+| is_resolved | BOOLEAN | NOT NULL, default False |
+| resolved_by | UUID | FK → users.id, NULLABLE |
+| moved_at | TIMESTAMPTZ | NOT NULL, server default now() |
+| resolved_at | TIMESTAMPTZ | NULLABLE |
+
+Index on `is_resolved` (partial index where `is_resolved = false`).
+
+---
+
+### 3.14 `app/models/__init__.py`
+
+Import and re-export ALL models so Alembic can discover them:
+
+```python
+from app.models.organization import Organization
+from app.models.user import User
+from app.models.project import Project
+from app.models.retry_policy import RetryPolicy
+from app.models.queue import Queue
+from app.models.batch import Batch
+from app.models.scheduled_job import ScheduledJob
+from app.models.job import Job
+from app.models.worker import Worker
+from app.models.heartbeat import WorkerHeartbeat
+from app.models.job_execution import JobExecution
+from app.models.job_log import JobLog
+from app.models.dead_letter_queue import DeadLetterQueueEntry
+```
+
+---
+
+## Phase 4: Schemas (`app/schemas/`)
+
+Use **Pydantic v2** models. For each entity, create:
+- `{Entity}Create` — fields for creation (no id, no timestamps)
+- `{Entity}Update` — all fields Optional for partial updates
+- `{Entity}Response` — full fields including id, timestamps, nested relations
+- `{Entity}ListResponse` — paginated list wrapper
+
+---
+
+### 4.1 `app/schemas/auth.py`
+
+```python
+class LoginRequest(BaseModel):
+    email: EmailStr
+    password: str
+
+class RegisterRequest(BaseModel):
+    email: EmailStr
+    password: str = Field(min_length=8)
+    full_name: str
+    organization_name: str  # creates org + user together
+
+class TokenResponse(BaseModel):
+    access_token: str
+    token_type: str = "bearer"
+    user: UserResponse
+
+class UserResponse(BaseModel):
+    id: UUID
+    email: str
+    full_name: str
+    role: UserRole
+    organization_id: UUID
+    is_active: bool
+    created_at: datetime
+```
+
+---
+
+### 4.2 `app/schemas/project.py`
+
+```python
+class ProjectCreate(BaseModel):
+    name: str = Field(min_length=1, max_length=255)
+    description: str | None = None
+
+class ProjectUpdate(BaseModel):
+    name: str | None = Field(None, min_length=1, max_length=255)
+    description: str | None = None
+
+class ProjectResponse(BaseModel):
+    id: UUID
+    organization_id: UUID
+    created_by: UUID
+    name: str
+    description: str | None
+    created_at: datetime
+    updated_at: datetime
+    queue_count: int | None = None  # computed field
+```
+
+---
+
+### 4.3 `app/schemas/queue.py`
+
+```python
+class QueueCreate(BaseModel):
+    name: str = Field(min_length=1, max_length=255)
+    description: str | None = None
+    priority: int = Field(default=0, ge=0, le=100)
+    max_concurrency: int = Field(default=10, ge=1, le=1000)
+    timeout_seconds: int = Field(default=3600, ge=1)
+    default_retry_policy_id: UUID | None = None
+
+class QueueUpdate(BaseModel):
+    name: str | None = None
+    description: str | None = None
+    priority: int | None = Field(None, ge=0, le=100)
+    max_concurrency: int | None = Field(None, ge=1, le=1000)
+    timeout_seconds: int | None = Field(None, ge=1)
+    default_retry_policy_id: UUID | None = None
+    is_paused: bool | None = None
+
+class QueueResponse(BaseModel):
+    id: UUID
+    project_id: UUID
+    name: str
+    description: str | None
+    priority: int
+    max_concurrency: int
+    timeout_seconds: int
+    is_paused: bool
+    default_retry_policy_id: UUID | None
+    created_at: datetime
+    updated_at: datetime
+
+class QueueStatsResponse(BaseModel):
+    queue_id: UUID
+    queue_name: str
+    total_jobs: int
+    queued: int
+    running: int
+    completed: int
+    failed: int
+    dead: int
+    avg_execution_time_seconds: float | None
+    throughput_per_minute: float | None
+```
+
+---
+
+### 4.4 `app/schemas/job.py`
+
+```python
+class JobCreate(BaseModel):
+    queue_id: UUID
+    job_type: JobType = JobType.IMMEDIATE
+    payload: dict = Field(default_factory=dict)
+    tags: dict | None = None
+    priority: int = Field(default=0, ge=0, le=100)
+    retry_policy_id: UUID | None = None
+    idempotency_key: str | None = None
+    timeout_seconds: int | None = None
+    # For delayed jobs
+    available_at: datetime | None = None  # required if job_type=DELAYED
+    # For batch jobs
+    batch_name: str | None = None
+    batch_jobs: list[dict] | None = None  # list of payloads for batch
+
+class ScheduledJobCreate(BaseModel):
+    queue_id: UUID
+    name: str
+    cron_expression: str  # validated with croniter
+    payload_template: dict = Field(default_factory=dict)
+    retry_policy_id: UUID | None = None
+
+class ScheduledJobUpdate(BaseModel):
+    name: str | None = None
+    cron_expression: str | None = None
+    payload_template: dict | None = None
+    is_active: bool | None = None
+
+class JobResponse(BaseModel):
+    id: UUID
+    queue_id: UUID
+    batch_id: UUID | None
+    scheduled_job_id: UUID | None
+    retry_policy_id: UUID | None
+    created_by: UUID
+    idempotency_key: str | None
+    job_type: str
+    payload: dict
+    tags: dict | None
+    priority: int
+    status: JobStatus
+    attempt_count: int
+    timeout_seconds: int | None
+    available_at: datetime | None
+    started_at: datetime | None
+    completed_at: datetime | None
+    created_at: datetime
+    updated_at: datetime
+
+class JobDetailResponse(JobResponse):
+    executions: list[JobExecutionResponse] = []
+    dlq_entry: DLQEntryResponse | None = None
+
+class JobExecutionResponse(BaseModel):
+    id: UUID
+    job_id: UUID
+    worker_id: UUID | None
+    attempt_number: int
+    status: ExecutionStatus
+    started_at: datetime
+    completed_at: datetime | None
+    result: dict | None
+    error_message: str | None
+    next_retry_at: datetime | None
+
+class DLQEntryResponse(BaseModel):
+    id: UUID
+    job_id: UUID
+    last_execution_id: UUID | None
+    failure_reason: str
+    attempt_count: int
+    is_resolved: bool
+    resolved_by: UUID | None
+    moved_at: datetime
+    resolved_at: datetime | None
+```
+
+---
+
+### 4.5 `app/schemas/worker.py`
+
+```python
+class WorkerRegisterRequest(BaseModel):
+    hostname: str
+    version: str | None = None
+
+class WorkerHeartbeatRequest(BaseModel):
+    cpu_usage: float | None = None
+    memory_usage: float | None = None
+    active_jobs: int = 0
+    status: HeartbeatStatus = HeartbeatStatus.HEALTHY
+
+class WorkerResponse(BaseModel):
+    id: UUID
+    organization_id: UUID
+    hostname: str
+    version: str | None
+    status: WorkerStatus
+    last_heartbeat_at: datetime | None
+    created_at: datetime
+    updated_at: datetime
+```
+
+---
+
+### 4.6 `app/schemas/metrics.py`
+
+```python
+class SystemMetricsResponse(BaseModel):
+    total_jobs: int
+    jobs_by_status: dict[str, int]
+    total_workers: int
+    active_workers: int
+    total_queues: int
+    paused_queues: int
+    dlq_unresolved: int
+    throughput_last_hour: int
+    avg_execution_time_seconds: float | None
+    failure_rate_percent: float | None
+
+class QueueThroughputResponse(BaseModel):
+    queue_id: UUID
+    queue_name: str
+    interval: str  # "1h", "24h", etc.
+    completed: int
+    failed: int
+    avg_duration_seconds: float | None
+```
+
+---
+
+### 4.7 Common pagination wrapper
+
+Create `app/schemas/common.py`:
+
+```python
+class PaginatedResponse(BaseModel, Generic[T]):
+    items: list[T]
+    total: int
+    page: int
+    page_size: int
+    total_pages: int
+```
+
+---
+
+## Phase 5: Repositories (`app/repositories/`)
+
+Repositories handle **all** database queries. Services NEVER write raw SQL. Each repository takes `AsyncSession` as a constructor parameter.
+
+---
+
+### 5.1 `app/repositories/user_repository.py`
+
+Methods:
+- `get_by_id(user_id: UUID) -> User | None`
+- `get_by_email(email: str) -> User | None`
+- `create(user: User) -> User`
+- `list_by_org(org_id: UUID, page, page_size) -> tuple[list[User], int]`
+
+---
+
+### 5.2 `app/repositories/project_repository.py`
+
+Methods:
+- `get_by_id(project_id: UUID) -> Project | None`
+- `create(project: Project) -> Project`
+- `update(project: Project) -> Project`
+- `delete(project_id: UUID) -> None`
+- `list_by_org(org_id: UUID, page, page_size) -> tuple[list[Project], int]`
+
+All queries MUST filter by `organization_id` — a user from Org A must NEVER see Org B's projects. The repository enforces this.
+
+---
+
+### 5.3 `app/repositories/queue_repository.py`
+
+Methods:
+- `get_by_id(queue_id: UUID) -> Queue | None`
+- `create(queue: Queue) -> Queue`
+- `update(queue: Queue) -> Queue`
+- `delete(queue_id: UUID) -> None`
+- `list_by_project(project_id: UUID, page, page_size) -> tuple[list[Queue], int]`
+- `get_stats(queue_id: UUID) -> QueueStatsResponse` — uses COUNT + GROUP BY on jobs table
+
+---
+
+### 5.4 `app/repositories/job_repository.py`
+
+**This is the most critical repository.** Methods:
+
+- `create(job: Job) -> Job`
+- `create_batch(jobs: list[Job]) -> list[Job]` — bulk insert
+- `get_by_id(job_id: UUID) -> Job | None`
+- `get_detail(job_id: UUID) -> Job` — eager loads executions and DLQ entry
+- `get_by_idempotency_key(key: str) -> Job | None`
+- `list_by_queue(queue_id, status_filter, page, page_size) -> tuple[list[Job], int]`
+- `claim_jobs(queue_id: UUID, limit: int) -> list[Job]` — **THE CRITICAL QUERY:**
+
+```python
+async def claim_jobs(self, queue_id: UUID, limit: int) -> list[Job]:
+    """
+    Atomically claims jobs using SELECT FOR UPDATE SKIP LOCKED.
+    This prevents duplicate claims across multiple workers.
+    """
+    stmt = (
+        select(Job)
+        .where(
+            Job.queue_id == queue_id,
+            Job.status == JobStatus.QUEUED,
+            or_(Job.available_at <= func.now(), Job.available_at.is_(None)),
+        )
+        .order_by(Job.priority.desc(), Job.created_at.asc())
+        .limit(limit)
+        .with_for_update(skip_locked=True)
+    )
+    result = await self.session.execute(stmt)
+    jobs = result.scalars().all()
+    
+    for job in jobs:
+        job.status = JobStatus.CLAIMED
+        job.started_at = func.now()
+    
+    await self.session.flush()
+    return jobs
+```
+
+- `update_status(job_id: UUID, status: JobStatus, **kwargs) -> Job`
+- `move_to_dlq(job_id: UUID, execution_id: UUID, reason: str, attempt_count: int) -> DeadLetterQueueEntry`
+
+---
+
+### 5.5 `app/repositories/worker_repository.py`
+
+Methods:
+- `register(worker: Worker) -> Worker`
+- `get_by_id(worker_id: UUID) -> Worker | None`
+- `update_status(worker_id: UUID, status: WorkerStatus) -> Worker`
+- `record_heartbeat(worker_id: UUID, heartbeat: WorkerHeartbeat) -> None`
+- `list_by_org(org_id: UUID, page, page_size) -> tuple[list[Worker], int]`
+- `get_stale_workers(threshold_seconds: int) -> list[Worker]` — workers with `last_heartbeat_at` older than threshold
+- `deactivate_worker(worker_id: UUID) -> None`
+
+---
+
+### 5.6 `app/repositories/metrics_repository.py`
+
+Methods:
+- `get_system_metrics(org_id: UUID) -> dict` — aggregate counts across all entities
+- `get_queue_throughput(queue_id: UUID, interval_hours: int) -> dict` — jobs completed/failed in time window
+- `get_job_status_distribution(org_id: UUID) -> dict[str, int]`
+- `get_avg_execution_time(queue_id: UUID) -> float | None`
+- `get_failure_rate(queue_id: UUID) -> float | None`
+- `get_throughput_per_minute(queue_id: UUID, last_minutes: int) -> float`
+
+All queries use efficient aggregate SQL — no loading full rows into Python.
+
+---
+
+## Phase 6: Utilities (`app/utils/`)
+
+---
+
+### 6.1 `app/utils/backoff.py`
+
+Implement three strategies. All return **delay in seconds** for a given attempt number:
+
+```python
+def calculate_backoff(
+    strategy: BackoffStrategy,
+    attempt: int,
+    base_delay: int,
+    max_delay: int
+) -> int:
+    if strategy == BackoffStrategy.FIXED:
+        return min(base_delay, max_delay)
+    elif strategy == BackoffStrategy.LINEAR:
+        return min(base_delay * attempt, max_delay)
+    elif strategy == BackoffStrategy.EXPONENTIAL:
+        return min(base_delay * (2 ** (attempt - 1)), max_delay)
+```
+
+---
+
+### 6.2 `app/utils/cron_parser.py`
+
+Wrap `croniter` to:
+- `validate_cron(expression: str) -> bool` — returns True if valid
+- `get_next_run(expression: str, base_time: datetime = None) -> datetime`
+- `get_previous_run(expression: str, base_time: datetime = None) -> datetime`
+
+Raise `ValueError` with descriptive message on invalid expressions.
+
+---
+
+### 6.3 `app/utils/queue_priority.py`
+
+Utility to compare and sort queues by priority. Higher number = higher priority.
+
+```python
+def sort_queues_by_priority(queues: list[Queue]) -> list[Queue]:
+    return sorted(queues, key=lambda q: q.priority, reverse=True)
+```
+
+---
+
+### 6.4 `app/utils/timestamps.py`
+
+```python
+from datetime import datetime, timezone
+
+def utc_now() -> datetime:
+    return datetime.now(timezone.utc)
+
+def seconds_ago(dt: datetime) -> float:
+    return (utc_now() - dt).total_seconds()
+
+def format_duration(seconds: float) -> str:
+    """Human-readable duration: '2m 30s', '1h 5m', etc."""
+```
+
+---
+
+### 6.5 `app/utils/metrics.py`
+
+Helper functions to compute rates and percentages:
+- `calculate_failure_rate(failed: int, total: int) -> float`
+- `calculate_throughput(count: int, seconds: float) -> float` — items per minute
+
+---
+
+## Phase 7: Services (`app/services/`)
+
+Services contain **business logic**. They validate rules, orchestrate across repositories, and raise `AppException` subclasses on errors. Each service takes repository instances (injected via dependencies).
+
+---
+
+### 7.1 `app/services/auth_service.py`
+
+Methods:
+- `register(data: RegisterRequest) -> TokenResponse`
+  - Create organization + user in a single transaction
+  - Hash password, set role=ADMIN (first user in org)
+  - Return JWT token
+- `login(data: LoginRequest) -> TokenResponse`
+  - Verify email exists, password matches
+  - Check `is_active`
+  - Return JWT token
+
+---
+
+### 7.2 `app/services/queue_service.py`
+
+Methods:
+- `create_queue(project_id: UUID, data: QueueCreate, user: User) -> QueueResponse`
+  - Verify project exists and belongs to user's org
+  - Verify queue name is unique within project
+  - If `default_retry_policy_id` provided, verify it exists in same org
+- `update_queue(queue_id: UUID, data: QueueUpdate, user: User) -> QueueResponse`
+- `delete_queue(queue_id: UUID, user: User) -> None`
+  - Only allowed if queue has no running jobs
+- `pause_queue(queue_id: UUID, user: User) -> QueueResponse`
+- `resume_queue(queue_id: UUID, user: User) -> QueueResponse`
+- `get_queue_stats(queue_id: UUID, user: User) -> QueueStatsResponse`
+- `list_queues(project_id: UUID, user: User, pagination) -> PaginatedResponse`
+
+---
+
+### 7.3 `app/services/job_service.py`
+
+**The most complex service.** Methods:
+
+- `create_job(data: JobCreate, user: User) -> JobResponse`
+  - Validate queue exists, is not paused, belongs to user's org
+  - Check idempotency_key uniqueness (raise `IdempotencyConflictException` if duplicate)
+  - Set `timeout_seconds` = job's value OR fall back to queue's `timeout_seconds`
+  - Set `retry_policy_id` = job's value OR fall back to queue's `default_retry_policy_id`
+  - Based on `job_type`:
+    - **IMMEDIATE**: `status=QUEUED`, `available_at=None`
+    - **DELAYED**: `status=SCHEDULED`, `available_at=data.available_at` (must be in future)
+    - **BATCH**: Create a `Batch` record, then bulk insert all `batch_jobs` payloads as individual jobs with `batch_id` set
+
+- `get_job(job_id: UUID, user: User) -> JobDetailResponse` — includes executions + DLQ
+- `list_jobs(queue_id: UUID, user: User, status: JobStatus = None, pagination) -> PaginatedResponse`
+- `cancel_job(job_id: UUID, user: User) -> JobResponse` — only if status is QUEUED or SCHEDULED
+- `retry_job(job_id: UUID, user: User) -> JobResponse`
+  - Only if status is FAILED or DEAD
+  - Reset status to QUEUED, reset attempt_count=0
+  - If in DLQ, mark DLQ entry as resolved
+
+- `create_scheduled_job(data: ScheduledJobCreate, user: User) -> ScheduledJobResponse`
+  - Validate cron expression with `cron_parser.validate_cron()`
+  - Calculate `next_run_at` using `cron_parser.get_next_run()`
+
+- `update_scheduled_job(id, data: ScheduledJobUpdate, user: User) -> ScheduledJobResponse`
+- `delete_scheduled_job(id, user: User) -> None`
+- `list_scheduled_jobs(queue_id, user, pagination) -> PaginatedResponse`
+
+---
+
+### 7.4 `app/services/worker_service.py`
+
+Methods:
+- `register_worker(data: WorkerRegisterRequest, user: User) -> WorkerResponse`
+- `deregister_worker(worker_id: UUID, user: User) -> None`
+- `list_workers(user: User, status: WorkerStatus = None, pagination) -> PaginatedResponse`
+- `get_worker(worker_id: UUID, user: User) -> WorkerResponse`
+
+---
+
+### 7.5 `app/services/heartbeat_service.py`
+
+Methods:
+- `record_heartbeat(worker_id: UUID, data: WorkerHeartbeatRequest) -> None`
+  - Insert heartbeat record
+  - Update `workers.last_heartbeat_at`
+  - Update `workers.status` based on heartbeat data
+- `check_stale_workers() -> list[Worker]`
+  - Find workers with no heartbeat in last `WORKERS_HEARTBEAT_INTERVAL * 3` seconds
+  - Mark them as OFFLINE
+  - Re-queue any jobs that were CLAIMED/RUNNING by these workers (set status back to QUEUED)
+
+---
+
+### 7.6 `app/services/retry_service.py`
+
+Methods:
+- `handle_failure(job: Job, execution: JobExecution, error: str) -> None`
+  - Load retry policy (from job or queue default)
+  - If `attempt_count < max_attempts`:
+    - Calculate delay using `backoff.calculate_backoff()`
+    - Set `job.status = QUEUED`
+    - Set `job.available_at = now() + delay`
+    - Set `job.attempt_count += 1`
+    - Set `execution.next_retry_at = job.available_at`
+  - Else:
+    - Call `dlq_service.move_to_dlq(job, execution, error)`
+- `create_retry_policy(data, user) -> RetryPolicyResponse`
+- `list_retry_policies(user, pagination) -> PaginatedResponse`
+- `update_retry_policy(id, data, user) -> RetryPolicyResponse`
+- `delete_retry_policy(id, user) -> None`
+
+---
+
+### 7.7 `app/services/dlq_service.py`
+
+Methods:
+- `move_to_dlq(job: Job, execution: JobExecution, reason: str) -> DLQEntry`
+  - Set `job.status = DEAD`
+  - Create DLQ entry with `failure_reason`, `attempt_count`
+- `list_dlq_entries(user: User, is_resolved: bool = None, pagination) -> PaginatedResponse`
+- `resolve_entry(dlq_id: UUID, user: User) -> DLQEntry`
+  - Mark `is_resolved = True`, `resolved_by = user.id`, `resolved_at = now()`
+- `retry_from_dlq(dlq_id: UUID, user: User) -> JobResponse`
+  - Reset job status to QUEUED, attempt_count=0
+  - Mark DLQ entry resolved
+
+---
+
+### 7.8 `app/services/scheduler_service.py`
+
+Methods:
+- `process_cron_jobs() -> int` — called periodically
+  - Find all `SCHEDULED_JOBS` where `is_active=True AND next_run_at <= now()`
+  - For each: create a new `JOB` record from the `payload_template`
+  - Update `last_run_at` and calculate `next_run_at`
+  - Return count of jobs created
+- `process_delayed_jobs() -> int`
+  - Find all `JOBS` where `status=SCHEDULED AND available_at <= now()`
+  - Update status to `QUEUED`
+  - Return count
+
+---
+
+### 7.9 `app/services/metrics_service.py`
+
+Methods:
+- `get_system_metrics(user: User) -> SystemMetricsResponse`
+- `get_queue_throughput(queue_id: UUID, interval: str, user: User) -> QueueThroughputResponse`
+- `get_dashboard_data(user: User) -> dict` — aggregates all metrics for the dashboard
+
+---
+
+### 7.10 `app/services/notification_service.py`
+
+**Purpose**: Extensible notification system. For now, implement as a simple logger that records events. Structure it so webhooks/email can be added later.
+
+Methods:
+- `notify_job_completed(job: Job) -> None`
+- `notify_job_failed(job: Job, error: str) -> None`
+- `notify_worker_offline(worker: Worker) -> None`
+- `notify_dlq_entry(entry: DLQEntry) -> None`
+
+---
+
+## Phase 8: API Routes (`app/api/`)
+
+Every route must:
+- Use `Depends(get_current_user)` for authentication
+- Use `Depends(get_db)` for database session
+- Use `PaginationParams` for list endpoints
+- Return proper HTTP status codes (201 for creation, 204 for deletion)
+- Include docstrings (they appear in Swagger/OpenAPI docs)
+
+---
+
+### 8.1 `app/api/auth.py`
+
+```
+POST /auth/register     → auth_service.register()       → 201 + TokenResponse
+POST /auth/login        → auth_service.login()           → 200 + TokenResponse
+GET  /auth/me           → return current_user             → 200 + UserResponse
+```
+
+This is the ONLY router that does NOT require authentication (except `/me`).
+
+---
+
+### 8.2 `app/api/organizations.py`
+
+```
+GET  /organizations/me  → return current user's org       → 200 + OrgResponse
+PUT  /organizations/me  → update org name/slug            → 200 + OrgResponse (ADMIN only)
+```
+
+---
+
+### 8.3 `app/api/projects.py`
+
+```
+POST   /projects                       → create project    → 201
+GET    /projects                       → list projects (org-scoped, paginated) → 200
+GET    /projects/{id}                  → get project        → 200
+PUT    /projects/{id}                  → update project     → 200
+DELETE /projects/{id}                  → delete project     → 204
+```
+
+---
+
+### 8.4 `app/api/queues.py`
+
+```
+POST   /projects/{project_id}/queues            → create queue      → 201
+GET    /projects/{project_id}/queues            → list queues       → 200
+GET    /queues/{queue_id}                       → get queue         → 200
+PUT    /queues/{queue_id}                       → update queue      → 200
+DELETE /queues/{queue_id}                       → delete queue      → 204
+POST   /queues/{queue_id}/pause                 → pause queue       → 200
+POST   /queues/{queue_id}/resume                → resume queue      → 200
+GET    /queues/{queue_id}/stats                 → queue statistics   → 200
+```
+
+---
+
+### 8.5 `app/api/jobs.py`
+
+```
+POST   /jobs                                    → create job (immediate/delayed/batch) → 201
+GET    /queues/{queue_id}/jobs                  → list jobs (filterable by status)      → 200
+GET    /jobs/{job_id}                           → get job detail (with executions)       → 200
+POST   /jobs/{job_id}/cancel                    → cancel job                             → 200
+POST   /jobs/{job_id}/retry                     → retry failed job                       → 200
+
+# Scheduled / Recurring jobs
+POST   /scheduled-jobs                          → create scheduled job                   → 201
+GET    /queues/{queue_id}/scheduled-jobs        → list scheduled jobs                    → 200
+GET    /scheduled-jobs/{id}                     → get scheduled job                      → 200
+PUT    /scheduled-jobs/{id}                     → update scheduled job                   → 200
+DELETE /scheduled-jobs/{id}                     → delete scheduled job                   → 204
+
+# Dead Letter Queue
+GET    /dlq                                     → list DLQ entries (filterable)          → 200
+POST   /dlq/{dlq_id}/retry                     → retry from DLQ                         → 200
+POST   /dlq/{dlq_id}/resolve                   → mark as resolved                       → 200
+
+# Batch
+GET    /batches/{batch_id}                      → get batch status                       → 200
+```
+
+---
+
+### 8.6 `app/api/workers.py`
+
+```
+POST   /workers/register                        → register worker    → 201
+POST   /workers/{worker_id}/heartbeat           → send heartbeat     → 200
+GET    /workers                                 → list workers       → 200
+GET    /workers/{worker_id}                     → get worker detail  → 200
+DELETE /workers/{worker_id}                     → deregister worker  → 204
+```
+
+---
+
+### 8.7 `app/api/scheduler.py`
+
+```
+POST   /scheduler/trigger-cron                  → manually trigger cron check   → 200
+POST   /scheduler/trigger-delayed               → manually trigger delayed check → 200
+GET    /scheduler/status                        → scheduler health/next-runs     → 200
+```
+
+These are admin-only endpoints for debugging.
+
+---
+
+### 8.8 `app/api/metrics.py`
+
+```
+GET    /metrics                                 → system-wide metrics            → 200
+GET    /metrics/queues/{queue_id}/throughput     → queue throughput over time     → 200
+GET    /metrics/dashboard                       → full dashboard data            → 200
+```
+
+---
+
+### 8.9 `app/api/health.py`
+
+```
+GET    /health                                  → {"status": "healthy", "db": "connected", "uptime": "..."}
+```
+
+No authentication required. Used by Docker health checks and monitoring.
+
+---
+
+### 8.10 Retry Policy Routes
+
+Add to `app/api/queues.py` or create `app/api/retry_policies.py`:
+
+```
+POST   /retry-policies                          → create retry policy  → 201
+GET    /retry-policies                          → list retry policies  → 200
+GET    /retry-policies/{id}                     → get retry policy     → 200
+PUT    /retry-policies/{id}                     → update retry policy  → 200
+DELETE /retry-policies/{id}                     → delete retry policy  → 204
+```
+
+---
+
+## Phase 9: Middleware (`app/middleware/`)
+
+---
+
+### 9.1 `app/middleware/exception_handler.py`
+
+Register as FastAPI exception handler. Catch:
+- `AppException` → return structured JSON: `{"error_code": "...", "detail": "...", "timestamp": "..."}`
+- `RequestValidationError` → return 422 with field-level errors
+- `Exception` → return 500 with generic message (log full traceback)
+
+---
+
+### 9.2 `app/middleware/request_logger.py`
+
+Log every request with:
+- Method, path, status code, duration (ms)
+- User ID and org ID (if authenticated)
+- Request ID (generate UUID, add to response headers as `X-Request-ID`)
+
+---
+
+### 9.3 `app/middleware/rate_limiter.py`
+
+Use `slowapi` to rate limit:
+- Auth endpoints: 10 requests/minute per IP
+- Job creation: 100 requests/minute per user
+- All other endpoints: 200 requests/minute per user
+
+Return `429 Too Many Requests` with `Retry-After` header when exceeded.
+
+---
+
+### 9.4 `app/middleware/auth.py`
+
+This is the middleware version of auth — it extracts the JWT from the `Authorization: Bearer <token>` header and makes user info available to the request context. Works with `get_current_user` dependency in `core/dependencies.py`.
+
+---
+
+## Phase 10: Worker Subsystem (`app/workers/`)
+
+These are **not** API routes — they run as separate processes (via `docker/worker.Dockerfile`).
+
+---
+
+### 10.1 `app/workers/worker.py`
+
+**The main worker loop.** This is the entrypoint (`scripts/start_worker.sh` runs this).
+
+```python
+async def run_worker():
+    worker = await register_self()  # register in DB
+    
+    shutdown_event = setup_graceful_shutdown()
+    heartbeat_task = asyncio.create_task(heartbeat_loop(worker.id))
+    
+    while not shutdown_event.is_set():
+        try:
+            jobs = await claim_jobs(worker.id)
+            if jobs:
+                await asyncio.gather(*[execute_job(job, worker.id) for job in jobs])
+            else:
+                await asyncio.sleep(settings.WORKERS_POLL_INTERVAL)
+        except Exception as e:
+            logger.error("Worker loop error", error=str(e))
+            await asyncio.sleep(settings.WORKERS_POLL_INTERVAL)
+    
+    await graceful_shutdown(worker.id, heartbeat_task)
+```
+
+---
+
+### 10.2 `app/workers/claim_jobs.py`
+
+Uses `job_repository.claim_jobs()`. Key points:
+- Open a new DB session per poll cycle
+- Respect queue's `max_concurrency` — claim at most that many jobs
+- Poll queues in priority order (highest first)
+- Entire claim operation is a single transaction
+
+---
+
+### 10.3 `app/workers/executor.py`
+
+```python
+async def execute_job(job: Job, worker_id: UUID):
+    execution = create_job_execution(job, worker_id)
+    
+    try:
+        # Set job status to RUNNING
+        job.status = JobStatus.RUNNING
+        
+        # Execute with timeout
+        result = await asyncio.wait_for(
+            run_payload(job.payload),
+            timeout=job.timeout_seconds
+        )
+        
+        # Mark completed
+        job.status = JobStatus.COMPLETED
+        job.completed_at = utc_now()
+        execution.status = ExecutionStatus.COMPLETED
+        execution.result = result
+        
+    except asyncio.TimeoutError:
+        execution.status = ExecutionStatus.TIMED_OUT
+        execution.error_message = f"Job timed out after {job.timeout_seconds}s"
+        await retry_service.handle_failure(job, execution, execution.error_message)
+        
+    except Exception as e:
+        execution.status = ExecutionStatus.FAILED
+        execution.error_message = str(e)
+        await retry_service.handle_failure(job, execution, str(e))
+    
+    finally:
+        execution.completed_at = utc_now()
+        await save(job, execution)
+```
+
+For `run_payload()`: since this is a demo system, simulate execution by sleeping for a random duration. Log the payload content. In a real system this would invoke actual task handlers.
+
+---
+
+### 10.4 `app/workers/heartbeat.py`
+
+```python
+async def heartbeat_loop(worker_id: UUID):
+    while True:
+        await heartbeat_service.record_heartbeat(worker_id, {
+            "cpu_usage": get_cpu_usage(),
+            "memory_usage": get_memory_usage(),
+            "active_jobs": get_active_job_count(),
+        })
+        await asyncio.sleep(settings.WORKERS_HEARTBEAT_INTERVAL)
+```
+
+Use `psutil` for CPU/memory metrics if available, otherwise use dummy values.
+
+---
+
+### 10.5 `app/workers/retry_handler.py`
+
+Wraps `retry_service.handle_failure()` for use within the worker process.
+
+---
+
+### 10.6 `app/workers/graceful_shutdown.py`
+
+```python
+def setup_graceful_shutdown() -> asyncio.Event:
+    shutdown_event = asyncio.Event()
+    
+    def handler(signum, frame):
+        logger.info("Shutdown signal received, draining...")
+        shutdown_event.set()
+    
+    signal.signal(signal.SIGTERM, handler)
+    signal.signal(signal.SIGINT, handler)
+    return shutdown_event
+
+async def graceful_shutdown(worker_id, heartbeat_task):
+    # 1. Stop accepting new jobs (set worker status to DRAINING)
+    # 2. Wait for in-flight jobs to complete (with a timeout)
+    # 3. Cancel heartbeat task
+    # 4. Set worker status to OFFLINE
+    # 5. Log shutdown complete
+```
+
+---
+
+## Phase 11: Scheduler Subsystem (`app/scheduler/`)
+
+These run as **background tasks inside the backend process** using `APScheduler` or `asyncio` tasks.
+
+---
+
+### 11.1 `app/scheduler/cron_scheduler.py`
+
+Runs every 60 seconds. Calls `scheduler_service.process_cron_jobs()`.
+
+---
+
+### 11.2 `app/scheduler/delayed_scheduler.py`
+
+Runs every 10 seconds. Calls `scheduler_service.process_delayed_jobs()`.
+
+---
+
+### 11.3 `app/scheduler/recurring_scheduler.py`
+
+Handles recurring jobs (same as cron but could have different intervals). Can merge with cron_scheduler if using cron expressions for all recurring jobs.
+
+---
+
+### 11.4 `app/scheduler/batch_scheduler.py`
+
+Runs every 30 seconds. Checks batch status:
+- Count completed/failed jobs per batch
+- Update `batches.completed_jobs`, `batches.failed_jobs`, `batches.status`
+- Set `status=COMPLETED` when all jobs done, `PARTIAL_FAILURE` if some failed, `FAILED` if all failed
+
+---
+
+## Phase 12: `main.py`
+
+**The application entrypoint.**
+
+```python
+from fastapi import FastAPI
+from contextlib import asynccontextmanager
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # STARTUP
+    # 1. Run migrations (alembic upgrade head)
+    # 2. Run seed data
+    # 3. Start scheduler background tasks
+    logger.info("Application started")
+    yield
+    # SHUTDOWN
+    # 1. Stop scheduler tasks
+    # 2. Close DB connections
+    logger.info("Application shutdown")
+
+app = FastAPI(
+    title="Distributed Job Scheduler",
+    version="1.0.0",
+    lifespan=lifespan,
+)
+
+# Register middleware (order matters — outermost first)
+app.add_middleware(RequestLoggerMiddleware)
+app.add_middleware(RateLimiterMiddleware)
+
+# Register exception handlers
+app.add_exception_handler(AppException, app_exception_handler)
+app.add_exception_handler(RequestValidationError, validation_exception_handler)
+
+# Register routers
+app.include_router(health_router, prefix="/api/v1", tags=["Health"])
+app.include_router(auth_router, prefix="/api/v1/auth", tags=["Auth"])
+app.include_router(org_router, prefix="/api/v1/organizations", tags=[
+<truncated 7323 bytes>
+
+NOTE: The output was truncated because it was too long. Use a more targeted query or a smaller range to get the information you need.
+<USER_REQUEST>
+continue where the previoud model left 
+</USER_REQUEST>
+<ADDITIONAL_METADATA>
+The current local time is: 2026-07-05T11:17:09+05:30.
+
+The user's current state is as follows:
+Active Document: c:\Users\seeth\OneDrive\Desktop\codity\backend\app\models\retry_policy.py (LANGUAGE_PYTHON)
+Cursor is on line: 21
+Other open documents:
+- c:\Users\seeth\OneDrive\Desktop\codity\frontend\public\.gitkeep (LANGUAGE_UNSPECIFIED)
+- c:\Users\seeth\OneDrive\Desktop\codity\backend\app\models\heartbeat.py (LANGUAGE_PYTHON)
+- c:\Users\seeth\OneDrive\Desktop\codity\backend\app\models\job_execution.py (LANGUAGE_PYTHON)
+- c:\Users\seeth\OneDrive\Desktop\codity\backend\app\models\job_log.py (LANGUAGE_PYTHON)
+- c:\Users\seeth\OneDrive\Desktop\codity\backend\app\models\dead_letter_queue.py (LANGUAGE_PYTHON)
+Browser State:
+  Page 3FD117E48AE137D82242048A13B081E5 (Chronos - Distributed Job Scheduler Dashboard) - http://localhost:3000/ [ACTIVE]
+    Viewport: 1762x861, Page Height: 860
+</ADDITIONAL_METADATA>
+<USER_SETTINGS_CHANGE>
+The user changed setting `Model Selection` from Claude Opus 4.6 (Thinking) to Gemini 3.1 Pro (High). No need to comment on this change if the user doesn't ask about it. If reporting what model you are, please use a human readable name instead of the exact string.
+</USER_SETTINGS_CHANGE>
